@@ -13,6 +13,10 @@ if exist "杂交版卡组助手.exe" (
     start "" "杂交版卡组助手.exe"
     exit /b 0
 )
+if exist "PvZHE-Deck-Assistant.exe" (
+    start "" "PvZHE-Deck-Assistant.exe"
+    exit /b 0
+)
 
 where python >nul 2>nul
 if errorlevel 1 (

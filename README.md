@@ -10,7 +10,7 @@
 
 ## 下载
 
-到 [Releases](https://github.com/Monody12/pvzhe-deck-assistant/releases) 下载 `杂交版卡组助手.exe`。
+到 [Releases](https://github.com/Monody12/pvzhe-deck-assistant/releases) 下载 `PvZHE-Deck-Assistant.exe`（可改名为 `杂交版卡组助手.exe`）。
 
 1. 启动杂交版 v3.12
 2. 运行助手（若游戏以管理员运行，助手也要用管理员运行）
