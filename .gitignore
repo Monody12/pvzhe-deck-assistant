@@ -5,7 +5,7 @@ dist/
 __pycache__/
 *.py[cod]
 .venv/
-杂交版卡组助手.exe
+*.exe
 *.zip
 .DS_Store
 Thumbs.db
