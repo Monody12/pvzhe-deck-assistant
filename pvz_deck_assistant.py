@@ -21,7 +21,7 @@ from typing import Iterable
 
 
 PROCESS_NAME = "PlantsVsZombies.exe"
-ASSISTANT_VERSION = "2.5.2"
+ASSISTANT_VERSION = "2.5.4"
 PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_VM_OPERATION = 0x0008
 PROCESS_VM_READ = 0x0010
@@ -33,6 +33,9 @@ INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 LAWN_APP_STATIC = 0x006A9EC0
 LAWN_APP_BOARD = 0x768
 LAWN_APP_CHOOSER = 0x774
+# 模态层数计数：主场景为 1，选卡界面叠加为 2，图鉴/菜单等再各 +1。
+# 实测杂交版 v3.12：选卡=2，选卡+图鉴=3，选卡+菜单=3，战斗=1。
+LAWN_APP_MODAL_LAYERS = 0x8DC
 BOARD_SEED_BANK = 0x144
 
 CHOOSER_FIRST_SEED = 0xA4
@@ -90,9 +93,22 @@ WIDGET_WIDTH = 0x10
 WIDGET_HEIGHT = 0x14
 
 HWND_TOPMOST = -1
+HWND_NOTOPMOST = -2
+# lawn+0x8DC 在纯选卡界面时的模态层数基线。
+CHOOSER_MODAL_LAYERS = 2
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
+SW_HIDE = 0
+SW_SHOWNA = 8
+GA_ROOT = 2
+GWL_EXSTYLE = -20
+WS_EX_TOPMOST = 0x00000008
+SM_CXSCREEN = 0
+SM_CYSCREEN = 1
 ERROR_ALREADY_EXISTS = 183
+OVERLAY_HIDE_DEBOUNCE = 3
 
 
 class DeckAssistantError(RuntimeError):
@@ -196,14 +212,22 @@ user32.IsIconic.argtypes = (wintypes.HWND,)
 user32.IsIconic.restype = wintypes.BOOL
 user32.GetParent.argtypes = (wintypes.HWND,)
 user32.GetParent.restype = wintypes.HWND
+user32.GetAncestor.argtypes = (wintypes.HWND, wintypes.UINT)
+user32.GetAncestor.restype = wintypes.HWND
 user32.GetClientRect.argtypes = (wintypes.HWND, ctypes.POINTER(RECT))
 user32.GetClientRect.restype = wintypes.BOOL
+user32.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(RECT))
+user32.GetWindowRect.restype = wintypes.BOOL
 user32.ClientToScreen.argtypes = (wintypes.HWND, ctypes.POINTER(POINT))
 user32.ClientToScreen.restype = wintypes.BOOL
 user32.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
 user32.GetClassNameW.restype = ctypes.c_int
 user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
 user32.GetWindowTextW.restype = ctypes.c_int
+user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+user32.ShowWindow.restype = wintypes.BOOL
+user32.GetWindowLongPtrW.argtypes = (wintypes.HWND, ctypes.c_int)
+user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
 user32.SetWindowPos.argtypes = (
     wintypes.HWND,
     wintypes.HWND,
@@ -214,6 +238,8 @@ user32.SetWindowPos.argtypes = (
     wintypes.UINT,
 )
 user32.SetWindowPos.restype = wintypes.BOOL
+user32.GetSystemMetrics.argtypes = (ctypes.c_int,)
+user32.GetSystemMetrics.restype = ctypes.c_int
 user32.MessageBoxW.argtypes = (
     wintypes.HWND,
     wintypes.LPCWSTR,
@@ -223,54 +249,99 @@ user32.MessageBoxW.argtypes = (
 user32.MessageBoxW.restype = ctypes.c_int
 
 
-def find_game_pid() -> int:
+def overlay_log(message: str) -> None:
+    """把覆盖层显隐决策写到用户目录，便于下次复现时对照。"""
+    try:
+        app_data = Path(os.environ.get("APPDATA", Path.home()))
+        path = app_data / "PvZHybridDeckAssistant" / "overlay.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = time.strftime("%Y-%m-%d %H:%M:%S") + " " + message + "\n"
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+        if path.stat().st_size > 200_000:
+            tail = path.read_text(encoding="utf-8", errors="ignore").splitlines()[-200:]
+            path.write_text("\n".join(tail) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def find_game_pids() -> list[int]:
     snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if snapshot == INVALID_HANDLE_VALUE:
         raise ctypes.WinError(ctypes.get_last_error())
+    pids: list[int] = []
     try:
         entry = PROCESSENTRY32W()
         entry.dwSize = ctypes.sizeof(entry)
         found = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
         while found:
             if entry.szExeFile.casefold() == PROCESS_NAME.casefold():
-                return int(entry.th32ProcessID)
+                pids.append(int(entry.th32ProcessID))
             found = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
     finally:
         kernel32.CloseHandle(snapshot)
-    raise DeckAssistantError("未检测到游戏，请先启动植物大战僵尸杂交版 v3.12。")
+    return pids
+
+
+def find_game_pid() -> int:
+    pids = find_game_pids()
+    if not pids:
+        raise DeckAssistantError("未检测到游戏，请先启动植物大战僵尸杂交版 v3.12。")
+    ranked: list[tuple[int, int]] = []
+    for pid in pids:
+        try:
+            hwnd = find_main_window(pid)
+            visible = bool(
+                user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd)
+            )
+            ranked.append((1 if visible else 0, pid))
+        except DeckAssistantError:
+            ranked.append((-1, pid))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return ranked[0][1]
 
 
 def find_main_window(pid: int) -> int:
-    candidates: list[tuple[int, int]] = []
+    candidates: list[tuple[int, int, int]] = []
 
     @WNDENUMPROC
     def callback(hwnd: int, _lparam: int) -> bool:
         window_pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
-        if window_pid.value != pid or not user32.IsWindowVisible(hwnd):
+        if window_pid.value != pid:
             return True
         class_name = ctypes.create_unicode_buffer(256)
         title = ctypes.create_unicode_buffer(512)
         user32.GetClassNameW(hwnd, class_name, 256)
         user32.GetWindowTextW(hwnd, title, 512)
+        rect = RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        width = max(0, rect.right - rect.left)
+        height = max(0, rect.bottom - rect.top)
         score = 0
         if class_name.value == "MainWindow":
-            score += 3
+            score += 10
         if any(
             token in title.value
             for token in ("植物大战僵尸", "杂交", "PlantsVsZombies")
         ):
-            score += 2
+            score += 5
         if title.value:
             score += 1
-        candidates.append((score, int(hwnd)))
+        if user32.IsWindowVisible(hwnd):
+            score += 8
+        if not user32.IsIconic(hwnd):
+            score += 2
+        if width >= 400 and height >= 300:
+            score += 4
+        candidates.append((score, width * height, int(hwnd)))
         return True
 
     user32.EnumWindows(callback, 0)
     if not candidates:
         raise DeckAssistantError("已检测到游戏进程，但尚未找到游戏窗口。")
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1]
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return candidates[0][2]
 
 
 class ProcessMemory:
@@ -794,8 +865,8 @@ class GameResourceNameResolver:
 
 
 class GameSession:
-    def __init__(self) -> None:
-        self.memory = ProcessMemory(find_game_pid())
+    def __init__(self, pid: int | None = None) -> None:
+        self.memory = ProcessMemory(pid if pid is not None else find_game_pid())
         self.executable_path = self.memory.image_path()
         self.hwnd = find_main_window(self.memory.pid)
         self.lawn_app = self.memory.u32(LAWN_APP_STATIC)
@@ -857,6 +928,13 @@ class GameSession:
             )
         return chooser
 
+    def modal_layers(self) -> int:
+        """读取模态层数；读不到时返回 0（视为未知，不据此隐藏）。"""
+        try:
+            return self.memory.u32(self.lawn_app + LAWN_APP_MODAL_LAYERS)
+        except OSError:
+            return 0
+
     def chooser_ready(self) -> bool:
         try:
             chooser = self._chooser()
@@ -864,21 +942,49 @@ class GameSession:
         except (OSError, DeckAssistantError):
             return False
 
+    def chooser_status(self) -> str:
+        try:
+            chooser_ptr = self.memory.u32(self.lawn_app + LAWN_APP_CHOOSER)
+            if not self._reasonable_pointer(chooser_ptr):
+                return f"no-chooser ptr=0x{chooser_ptr:08X}"
+            chooser = self._chooser()
+            button = self.memory.u32(chooser + CHOOSER_START_BUTTON)
+            if not self._reasonable_pointer(button):
+                return f"chooser-ok button=0x{button:08X}"
+            width = self.memory.u32(button + WIDGET_WIDTH)
+            height = self.memory.u32(button + WIDGET_HEIGHT)
+            x = self._signed_u32(self.memory.u32(button + WIDGET_X))
+            y = self._signed_u32(self.memory.u32(button + WIDGET_Y))
+            active = self._chooser_ui_active(chooser)
+            return (
+                f"{'ready' if active else 'geom'} "
+                f"w={width} h={height} x={x} y={y} "
+                f"modal={self.modal_layers()}"
+            )
+        except Exception as exc:
+            return f"error:{exc}"
+
     def _chooser_ui_active(self, chooser: int) -> bool:
-        """开始按钮仍在选卡面板上时，才视为真正的选卡界面。"""
+        """开始按钮在选卡面板上且没有模态界面（图鉴/菜单）盖住时，才算选卡中。"""
         button = self.memory.u32(chooser + CHOOSER_START_BUTTON)
         if not self._reasonable_pointer(button):
             return False
         width = self.memory.u32(button + WIDGET_WIDTH)
         height = self.memory.u32(button + WIDGET_HEIGHT)
-        x = self.memory.u32(button + WIDGET_X)
-        y = self.memory.u32(button + WIDGET_Y)
-        return (
-            80 <= width <= 400
-            and 20 <= height <= 90
-            and 0 <= x <= 1080
-            and 80 <= y <= 700
+        x = self._signed_u32(self.memory.u32(button + WIDGET_X))
+        y = self._signed_u32(self.memory.u32(button + WIDGET_Y))
+        if width > 0x7FFFFFFF:
+            width = self._signed_u32(width)
+        if height > 0x7FFFFFFF:
+            height = self._signed_u32(height)
+        geometry_ok = (
+            40 <= width <= 800
+            and 10 <= height <= 200
+            and -200 <= x <= 2000
+            and 0 <= y <= 1200
         )
+        # 图鉴或菜单石碑盖在选卡上时按钮几何不变，靠模态层数识别（选卡=2）。
+        return geometry_ok and self.modal_layers() == CHOOSER_MODAL_LAYERS
 
     @staticmethod
     def _seed_address(chooser: int, seed_id: int) -> int:
@@ -1542,15 +1648,36 @@ class GameConnector:
                 if (
                     self.session.memory.u32(LAWN_APP_STATIC)
                     == self.session.lawn_app
-                    and user32.IsWindow(self.session.hwnd)
                 ):
-                    return self.session
+                    try:
+                        self.session.hwnd = find_main_window(self.session.memory.pid)
+                    except DeckAssistantError:
+                        pass
+                    if user32.IsWindow(self.session.hwnd):
+                        return self.session
             except Exception:
                 self.close()
-        try:
-            self.session = GameSession()
-        except Exception:
+        pids = find_game_pids()
+        if not pids:
             self.session = None
+            return self.session
+        try:
+            preferred = find_game_pid()
+            ordered = [preferred] + [pid for pid in pids if pid != preferred]
+        except DeckAssistantError:
+            ordered = pids
+        for pid in ordered:
+            try:
+                self.session = GameSession(pid)
+                overlay_log(
+                    f"attached pid={pid} hwnd={self.session.hwnd} "
+                    f"path={self.session.executable_path}"
+                )
+                return self.session
+            except Exception as exc:
+                overlay_log(f"attach pid={pid} failed: {exc}")
+                continue
+        self.session = None
         return self.session
 
 
@@ -1879,12 +2006,16 @@ class IntegratedDeckOverlay:
         self._drag_geom = (0, 0)
         self._last_place: tuple[int, int, int, int] | None = None
         self._overlay_visible = False
+        self._hide_misses = 0
+        self._last_tick_reason = ""
+        self._tk_mapped = False
         self._prefs_ready = False
         self._build()
         self._prefs_ready = True
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self._refresh_slot_buttons()
         self.root.withdraw()
+        overlay_log(f"assistant start v{ASSISTANT_VERSION}")
         self._tick()
 
     def _load_resource_names(self, session: GameSession) -> None:
@@ -2306,37 +2437,110 @@ class IntegratedDeckOverlay:
     def _tick(self) -> None:
         try:
             session = self.connector.ensure_session()
-            game_visible = bool(
-                session
-                and user32.IsWindowVisible(session.hwnd)
-                and not user32.IsIconic(session.hwnd)
-            )
-            if not game_visible or not session.chooser_ready():
-                self._hide_overlay()
+            if not session:
+                self._note_hide("no-session")
+                self._schedule_hide()
             else:
-                self._load_resource_names(session)
-                self._attach_to_game(session)
-                tooltip_name = session.current_tooltip_name()
-                if tooltip_name:
-                    self.name_store.update(dict([tooltip_name]))
-                if self.status.get().startswith(("等待", "请进入")):
-                    self.status.set("保存 / 应用 / 清空；双击卡组位改名")
-        except Exception:
+                game_visible = bool(
+                    user32.IsWindow(session.hwnd)
+                    and user32.IsWindowVisible(session.hwnd)
+                    and not user32.IsIconic(session.hwnd)
+                )
+                chooser_ok = session.chooser_ready()
+                if not game_visible:
+                    self._note_hide(
+                        f"game-window hwnd={session.hwnd} "
+                        f"visible={bool(user32.IsWindowVisible(session.hwnd))} "
+                        f"iconic={bool(user32.IsIconic(session.hwnd))}"
+                    )
+                    self._schedule_hide()
+                elif not chooser_ok:
+                    self._note_hide(session.chooser_status())
+                    self._schedule_hide()
+                else:
+                    self._hide_misses = 0
+                    self._note_show(session)
+                    self._load_resource_names(session)
+                    self._attach_to_game(session)
+                    tooltip_name = session.current_tooltip_name()
+                    if tooltip_name:
+                        self.name_store.update(dict([tooltip_name]))
+                    if self.status.get().startswith(("等待", "请进入")):
+                        self.status.set("保存 / 应用 / 清空；双击卡组位改名")
+        except Exception as exc:
+            overlay_log(f"tick-error {exc!r}")
+            self._note_hide(f"tick-error {exc}")
             try:
-                self._hide_overlay()
+                self._schedule_hide()
             except Exception:
                 pass
         try:
             self.root.after(250, self._tick)
+        except Exception as exc:
+            overlay_log(f"after-failed {exc!r}")
+
+    def _note_hide(self, reason: str) -> None:
+        if reason != self._last_tick_reason:
+            overlay_log(f"hide {reason}")
+            self._last_tick_reason = reason
+
+    def _note_show(self, session: GameSession) -> None:
+        reason = f"show pid={session.memory.pid} hwnd={session.hwnd}"
+        if reason != self._last_tick_reason:
+            overlay_log(f"{reason} {session.chooser_status()}")
+            self._last_tick_reason = reason
+
+    def _schedule_hide(self) -> None:
+        self._hide_misses += 1
+        if self._hide_misses >= OVERLAY_HIDE_DEBOUNCE:
+            self._hide_overlay()
+
+    def _overlay_hwnd(self) -> int:
+        content_hwnd = int(self.root.winfo_id())
+        root_hwnd = int(user32.GetAncestor(content_hwnd, GA_ROOT) or 0)
+        if root_hwnd:
+            return root_hwnd
+        wrapper_hwnd = int(user32.GetParent(content_hwnd) or 0)
+        return wrapper_hwnd or content_hwnd
+
+    def _win32_hide_overlay(self) -> None:
+        try:
+            hwnd = self._overlay_hwnd()
         except Exception:
-            pass
+            return
+        user32.ShowWindow(hwnd, SW_HIDE)
+
+    def _demote_game_topmost(self, hwnd: int) -> None:
+        """窗口模式下清掉游戏残留的 TOPMOST，避免 DirectDraw 把小条永远压在下面。"""
+        rect = RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+        screen_w = user32.GetSystemMetrics(SM_CXSCREEN)
+        screen_h = user32.GetSystemMetrics(SM_CYSCREEN)
+        if width >= screen_w - 8 or height >= screen_h - 8:
+            return
+        style = int(user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE))
+        if not (style & WS_EX_TOPMOST):
+            return
+        user32.SetWindowPos(
+            hwnd,
+            HWND_NOTOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+        overlay_log(f"demoted-game-topmost hwnd={hwnd}")
 
     def _hide_overlay(self) -> None:
         if self.order_strip and self.order_strip.window.winfo_exists():
             self.order_strip.close()
             self.order_strip = None
         if self._overlay_visible:
-            self.root.withdraw()
+            self._win32_hide_overlay()
             self._overlay_visible = False
             self._last_place = None
 
@@ -2348,6 +2552,7 @@ class IntegratedDeckOverlay:
             return
         place = self._client_origin_size(session)
         if not place:
+            overlay_log("attach skipped: no client rect")
             return
         origin_x, origin_y, game_width, game_height = place
         panel_width = max(280, min(340, int(game_width * 0.30)))
@@ -2364,20 +2569,22 @@ class IntegratedDeckOverlay:
         except Exception:
             pass
         key = (x, y, panel_width, self.PANEL_HEIGHT)
-        if key == self._last_place:
-            if not self._overlay_visible:
-                self.root.deiconify()
-                self._overlay_visible = True
-            return
-        self._last_place = key
-        self.root.geometry(
-            f"{panel_width}x{self.PANEL_HEIGHT}+{x}+{y}"
-        )
-        self.root.update_idletasks()
-        content_hwnd = int(self.root.winfo_id())
-        wrapper_hwnd = user32.GetParent(content_hwnd)
-        overlay_hwnd = int(wrapper_hwnd or content_hwnd)
-        user32.SetWindowPos(
+        if key != self._last_place:
+            self._last_place = key
+            self.root.geometry(
+                f"{panel_width}x{self.PANEL_HEIGHT}+{x}+{y}"
+            )
+            self.root.update_idletasks()
+        if not self._tk_mapped:
+            self.root.deiconify()
+            self._tk_mapped = True
+        try:
+            self.root.attributes("-topmost", True)
+        except Exception:
+            pass
+        overlay_hwnd = self._overlay_hwnd()
+        self._demote_game_topmost(session.hwnd)
+        placed = user32.SetWindowPos(
             overlay_hwnd,
             HWND_TOPMOST,
             x,
@@ -2386,7 +2593,13 @@ class IntegratedDeckOverlay:
             self.PANEL_HEIGHT,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         )
-        self.root.deiconify()
+        user32.ShowWindow(overlay_hwnd, SW_SHOWNA)
+        visible = bool(user32.IsWindowVisible(overlay_hwnd))
+        if not placed or not visible:
+            overlay_log(
+                f"raise-failed placed={bool(placed)} visible={visible} "
+                f"overlay={overlay_hwnd} game={session.hwnd}"
+            )
         self._overlay_visible = True
 
     def close(self) -> None:

@@ -1,0 +1,27 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build assistant
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\build-assistant.ps1
+          Copy-Item -LiteralPath ".\杂交版卡组助手.exe" -Destination .\PvZHE-Deck-Assistant.exe -Force
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: PvZHE-Deck-Assistant.exe
+          generate_release_notes: true
