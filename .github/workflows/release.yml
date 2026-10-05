@@ -19,8 +19,10 @@ jobs:
       - name: Build assistant
         shell: pwsh
         run: |
-          powershell -ExecutionPolicy Bypass -File .\build-assistant.ps1
-          Copy-Item -LiteralPath ".\杂交版卡组助手.exe" -Destination .\PvZHE-Deck-Assistant.exe -Force
+          & .\build-assistant.ps1
+          $built = Get-ChildItem -File -Filter *.exe | Where-Object { $_.Name -ne 'PvZHE-Deck-Assistant.exe' } | Select-Object -First 1
+          if (-not $built) { throw 'PyInstaller did not produce an exe' }
+          Copy-Item -LiteralPath $built.FullName -Destination .\PvZHE-Deck-Assistant.exe -Force
       - uses: softprops/action-gh-release@v2
         with:
           files: PvZHE-Deck-Assistant.exe
