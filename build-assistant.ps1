@@ -10,7 +10,7 @@ if (-not (Test-Path ".build-venv\Scripts\python.exe")) {
     --noconfirm `
     --clean `
     --onefile `
-    --windowed `
+    --console `
     --noupx `
     --name "杂交版卡组助手" `
     --distpath "." `

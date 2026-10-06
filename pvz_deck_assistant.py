@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 from contextlib import contextmanager
 import ctypes
 from ctypes import wintypes
@@ -21,7 +22,7 @@ from typing import Iterable
 
 
 PROCESS_NAME = "PlantsVsZombies.exe"
-ASSISTANT_VERSION = "2.5.4"
+ASSISTANT_VERSION = "2.5.5"
 PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_VM_OPERATION = 0x0008
 PROCESS_VM_READ = 0x0010
@@ -33,8 +34,12 @@ INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 LAWN_APP_STATIC = 0x006A9EC0
 LAWN_APP_BOARD = 0x768
 LAWN_APP_CHOOSER = 0x774
-# 模态层数计数：主场景为 1，选卡界面叠加为 2，图鉴/菜单等再各 +1。
-# 实测杂交版 v3.12：选卡=2，选卡+图鉴=3，选卡+菜单=3，战斗=1。
+# SexyAppBase::mWidgetManager。顶层模态对话框在 Manager+0x94。
+# 选卡无覆盖时该指针为 0；图鉴 type=1、菜单 type=8。
+LAWN_APP_WIDGET_MANAGER = 0x320
+WIDGET_MANAGER_TOP_MODAL = 0x94
+DIALOG_ID = 0x0C
+# lawn+0x8DC 仅用于日志。后期关卡基线不是 2，且关图鉴后可能不回落。
 LAWN_APP_MODAL_LAYERS = 0x8DC
 BOARD_SEED_BANK = 0x144
 
@@ -94,8 +99,6 @@ WIDGET_HEIGHT = 0x14
 
 HWND_TOPMOST = -1
 HWND_NOTOPMOST = -2
-# lawn+0x8DC 在纯选卡界面时的模态层数基线。
-CHOOSER_MODAL_LAYERS = 2
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
@@ -193,6 +196,16 @@ kernel32.CreateMutexW.argtypes = (
     wintypes.LPCWSTR,
 )
 kernel32.CreateMutexW.restype = wintypes.HANDLE
+kernel32.GetConsoleWindow.argtypes = ()
+kernel32.GetConsoleWindow.restype = wintypes.HWND
+kernel32.AllocConsole.argtypes = ()
+kernel32.AllocConsole.restype = wintypes.BOOL
+kernel32.SetStdHandle.argtypes = (wintypes.DWORD, wintypes.HANDLE)
+kernel32.SetStdHandle.restype = wintypes.BOOL
+kernel32.SetConsoleCtrlHandler.argtypes = (ctypes.c_void_p, wintypes.BOOL)
+kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
+kernel32.FreeConsole.argtypes = ()
+kernel32.FreeConsole.restype = wintypes.BOOL
 ntdll.NtSuspendProcess.argtypes = (wintypes.HANDLE,)
 ntdll.NtSuspendProcess.restype = wintypes.LONG
 ntdll.NtResumeProcess.argtypes = (wintypes.HANDLE,)
@@ -249,11 +262,14 @@ user32.MessageBoxW.argtypes = (
 user32.MessageBoxW.restype = ctypes.c_int
 
 
+def _app_data_dir() -> Path:
+    return Path(os.environ.get("APPDATA", Path.home())) / "PvZHybridDeckAssistant"
+
+
 def overlay_log(message: str) -> None:
     """把覆盖层显隐决策写到用户目录，便于下次复现时对照。"""
     try:
-        app_data = Path(os.environ.get("APPDATA", Path.home()))
-        path = app_data / "PvZHybridDeckAssistant" / "overlay.log"
+        path = _app_data_dir() / "overlay.log"
         path.parent.mkdir(parents=True, exist_ok=True)
         line = time.strftime("%Y-%m-%d %H:%M:%S") + " " + message + "\n"
         with path.open("a", encoding="utf-8") as handle:
@@ -263,6 +279,65 @@ def overlay_log(message: str) -> None:
             path.write_text("\n".join(tail) + "\n", encoding="utf-8")
     except OSError:
         pass
+
+
+_FROZEN_STDIO_READY = False
+
+
+def _install_frozen_stdio() -> None:
+    """给打包进程补上有效标准句柄，并藏掉控制台窗口。
+
+    Python 3.14 的 windowed/runw 在图鉴抢焦点时会直接 abort；
+    控制台子系统从启动起就有合法 stderr，Tcl 不会崩。
+    """
+    global _FROZEN_STDIO_READY
+    if _FROZEN_STDIO_READY or not getattr(sys, "frozen", False):
+        return
+    try:
+        if not kernel32.GetConsoleWindow():
+            kernel32.AllocConsole()
+        hwnd = kernel32.GetConsoleWindow()
+        if hwnd:
+            user32.ShowWindow(hwnd, SW_HIDE)
+    except Exception:
+        pass
+    try:
+        path = _app_data_dir() / "console.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stream = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
+        fault = open(_app_data_dir() / "fault.log", "ab", buffering=0)
+    except OSError:
+        return
+    try:
+        os.dup2(stream.fileno(), 1)
+        os.dup2(stream.fileno(), 2)
+    except OSError:
+        pass
+    try:
+        import msvcrt
+
+        os_handle = msvcrt.get_osfhandle(stream.fileno())
+        kernel32.SetStdHandle(wintypes.DWORD(-11), os_handle)
+        kernel32.SetStdHandle(wintypes.DWORD(-12), os_handle)
+    except Exception:
+        pass
+    sys.stdout = stream
+    sys.stderr = stream
+    try:
+        import faulthandler
+
+        faulthandler.enable(file=fault, all_threads=True)
+    except Exception:
+        pass
+    try:
+        kernel32.SetConsoleCtrlHandler(None, True)
+        kernel32.FreeConsole()
+    except Exception:
+        pass
+    _FROZEN_STDIO_READY = True
+
+
+_install_frozen_stdio()
 
 
 def find_game_pids() -> list[int]:
@@ -929,16 +1004,29 @@ class GameSession:
         return chooser
 
     def modal_layers(self) -> int:
-        """读取模态层数；读不到时返回 0（视为未知，不据此隐藏）。"""
+        """读取 lawn+0x8DC，仅日志用。"""
         try:
             return self.memory.u32(self.lawn_app + LAWN_APP_MODAL_LAYERS)
+        except OSError:
+            return 0
+
+    def covering_dialog_id(self) -> int:
+        """顶层模态对话框 id；0 表示没有盖住选卡的图鉴/菜单等。读失败也返回 0。"""
+        try:
+            manager = self.memory.u32(self.lawn_app + LAWN_APP_WIDGET_MANAGER)
+            if not self._reasonable_pointer(manager):
+                return 0
+            dialog = self.memory.u32(manager + WIDGET_MANAGER_TOP_MODAL)
+            if not self._reasonable_pointer(dialog):
+                return 0
+            return self.memory.u32(dialog + DIALOG_ID)
         except OSError:
             return 0
 
     def chooser_ready(self) -> bool:
         try:
             chooser = self._chooser()
-            return self._chooser_ui_active(chooser)
+            return self._chooser_geometry_ok(chooser)
         except (OSError, DeckAssistantError):
             return False
 
@@ -955,17 +1043,18 @@ class GameSession:
             height = self.memory.u32(button + WIDGET_HEIGHT)
             x = self._signed_u32(self.memory.u32(button + WIDGET_X))
             y = self._signed_u32(self.memory.u32(button + WIDGET_Y))
-            active = self._chooser_ui_active(chooser)
+            geometry_ok = self._chooser_geometry_ok(chooser)
             return (
-                f"{'ready' if active else 'geom'} "
+                f"{'ready' if geometry_ok else 'geom'} "
                 f"w={width} h={height} x={x} y={y} "
-                f"modal={self.modal_layers()}"
+                f"modal={self.modal_layers()} "
+                f"cover={self.covering_dialog_id()}"
             )
         except Exception as exc:
             return f"error:{exc}"
 
-    def _chooser_ui_active(self, chooser: int) -> bool:
-        """开始按钮在选卡面板上且没有模态界面（图鉴/菜单）盖住时，才算选卡中。"""
+    def _chooser_geometry_ok(self, chooser: int) -> bool:
+        """开始按钮几何合法即认为选卡界面还在。图鉴/菜单盖住时几何仍合法。"""
         button = self.memory.u32(chooser + CHOOSER_START_BUTTON)
         if not self._reasonable_pointer(button):
             return False
@@ -977,14 +1066,12 @@ class GameSession:
             width = self._signed_u32(width)
         if height > 0x7FFFFFFF:
             height = self._signed_u32(height)
-        geometry_ok = (
+        return (
             40 <= width <= 800
             and 10 <= height <= 200
             and -200 <= x <= 2000
             and 0 <= y <= 1200
         )
-        # 图鉴或菜单石碑盖在选卡上时按钮几何不变，靠模态层数识别（选卡=2）。
-        return geometry_ok and self.modal_layers() == CHOOSER_MODAL_LAYERS
 
     @staticmethod
     def _seed_address(chooser: int, seed_id: int) -> int:
@@ -2013,10 +2100,23 @@ class IntegratedDeckOverlay:
         self._build()
         self._prefs_ready = True
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.report_callback_exception = self._on_tk_exception
         self._refresh_slot_buttons()
         self.root.withdraw()
-        overlay_log(f"assistant start v{ASSISTANT_VERSION}")
+        overlay_log(
+            f"assistant start v{ASSISTANT_VERSION} "
+            f"frozen={bool(getattr(sys, 'frozen', False))}"
+        )
         self._tick()
+
+    def _on_tk_exception(self, exc: object, val: object, tb: object) -> None:
+        overlay_log(f"tk-error {val!r}")
+        try:
+            import traceback
+
+            overlay_log("".join(traceback.format_exception(exc, val, tb))[:2000])
+        except Exception:
+            pass
 
     def _load_resource_names(self, session: GameSession) -> None:
         if self._resource_names_pid == session.memory.pid:
@@ -2447,6 +2547,7 @@ class IntegratedDeckOverlay:
                     and not user32.IsIconic(session.hwnd)
                 )
                 chooser_ok = session.chooser_ready()
+                covering = session.covering_dialog_id()
                 if not game_visible:
                     self._note_hide(
                         f"game-window hwnd={session.hwnd} "
@@ -2455,6 +2556,9 @@ class IntegratedDeckOverlay:
                     )
                     self._schedule_hide()
                 elif not chooser_ok:
+                    self._note_hide(session.chooser_status())
+                    self._schedule_hide()
+                elif covering:
                     self._note_hide(session.chooser_status())
                     self._schedule_hide()
                 else:
@@ -2603,13 +2707,18 @@ class IntegratedDeckOverlay:
         self._overlay_visible = True
 
     def close(self) -> None:
+        overlay_log("overlay-close")
         if self.order_strip and self.order_strip.window.winfo_exists():
             self.order_strip.close()
         self.connector.close()
         self.root.destroy()
 
     def run(self) -> None:
-        self.root.mainloop()
+        overlay_log("mainloop-enter")
+        try:
+            self.root.mainloop()
+        finally:
+            overlay_log("mainloop-exit")
 
 
 class DeckAssistantWindow:
@@ -2800,6 +2909,8 @@ def print_status() -> int:
 
 
 def main() -> int:
+    _install_frozen_stdio()
+    atexit.register(lambda: overlay_log("assistant atexit"))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--status",
