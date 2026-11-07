@@ -22,7 +22,7 @@ from typing import Iterable
 
 
 PROCESS_NAME = "PlantsVsZombies.exe"
-ASSISTANT_VERSION = "2.5.6"
+ASSISTANT_VERSION = "2.5.7"
 PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_VM_OPERATION = 0x0008
 PROCESS_VM_READ = 0x0010
@@ -35,10 +35,15 @@ LAWN_APP_STATIC = 0x006A9EC0
 LAWN_APP_BOARD = 0x768
 LAWN_APP_CHOOSER = 0x774
 # SexyAppBase::mWidgetManager。顶层模态对话框在 Manager+0x94。
-# 选卡无覆盖时该指针为 0；图鉴 type=1、菜单 type=8。
+# 选卡无覆盖时该指针为 0。实测 dialog+0x0C：1=图鉴 2=暂停 3=是否
+# 4=商店 6=用户 8=菜单 9=选卡界面墓碑菜单。其它 id 不当作遮挡，
+# 避免关卡切换后残留指针把悬浮条一直藏住。
 LAWN_APP_WIDGET_MANAGER = 0x320
+WIDGET_MANAGER_TOP_WIDGET = 0x88
 WIDGET_MANAGER_TOP_MODAL = 0x94
 DIALOG_ID = 0x0C
+WIDGET_VISIBLE = 0x54
+COVERING_DIALOG_IDS = frozenset({1, 2, 3, 4, 6, 8, 9})
 # lawn+0x8DC 仅用于日志。后期关卡基线不是 2，且关图鉴后可能不回落。
 LAWN_APP_MODAL_LAYERS = 0x8DC
 BOARD_SEED_BANK = 0x144
@@ -111,7 +116,11 @@ WS_EX_TOPMOST = 0x00000008
 SM_CXSCREEN = 0
 SM_CYSCREEN = 1
 ERROR_ALREADY_EXISTS = 183
+VK_LBUTTON = 0x01
 OVERLAY_HIDE_DEBOUNCE = 3
+LOG_ROTATE_BYTES = 1_000_000
+LOG_KEEP_LINES = 2000
+HEARTBEAT_SECONDS = 30
 
 
 class DeckAssistantError(RuntimeError):
@@ -212,6 +221,8 @@ ntdll.NtResumeProcess.argtypes = (wintypes.HANDLE,)
 ntdll.NtResumeProcess.restype = wintypes.LONG
 user32.EnumWindows.argtypes = (WNDENUMPROC, wintypes.LPARAM)
 user32.EnumWindows.restype = wintypes.BOOL
+user32.GetAsyncKeyState.argtypes = (wintypes.INT,)
+user32.GetAsyncKeyState.restype = wintypes.SHORT
 user32.GetWindowThreadProcessId.argtypes = (
     wintypes.HWND,
     ctypes.POINTER(wintypes.DWORD),
@@ -274,8 +285,10 @@ def overlay_log(message: str) -> None:
         line = time.strftime("%Y-%m-%d %H:%M:%S") + " " + message + "\n"
         with path.open("a", encoding="utf-8") as handle:
             handle.write(line)
-        if path.stat().st_size > 200_000:
-            tail = path.read_text(encoding="utf-8", errors="ignore").splitlines()[-200:]
+        if path.stat().st_size > LOG_ROTATE_BYTES:
+            tail = path.read_text(encoding="utf-8", errors="ignore").splitlines()[
+                -LOG_KEEP_LINES:
+            ]
             path.write_text("\n".join(tail) + "\n", encoding="utf-8")
     except OSError:
         pass
@@ -963,7 +976,9 @@ class GameSession:
 
     @staticmethod
     def _reasonable_pointer(value: int) -> bool:
-        return 0x10000 <= value <= 0x7FFFFFFF
+        # 游戏是大地址感知的 32 位进程，堆水位高时对象会分配在 2GB 以上
+        # （实测坚果挑战3 chooser=0x82784008）。上限放宽到 32 位用户空间顶。
+        return 0x10000 <= value <= 0xFFFEFFFF
 
     def _board(self) -> int:
         board = self.memory.u32(self.lawn_app + LAWN_APP_BOARD)
@@ -1011,17 +1026,30 @@ class GameSession:
             return 0
 
     def covering_dialog_id(self) -> int:
-        """顶层模态对话框 id；0 表示没有盖住选卡的图鉴/菜单等。读失败也返回 0。"""
+        """若有盖住选卡的图鉴/菜单等则返回其 id，否则 0。读失败也返回 0。"""
+        raw_id, visible = self._top_modal_raw()
+        if not visible or raw_id not in COVERING_DIALOG_IDS:
+            return 0
+        return raw_id
+
+    def _top_modal_raw(self) -> tuple[int, int]:
+        """返回 (dialog+0x0C 原始 id, 可见标志)。没有真正盖住的模态时 vis=0。"""
         try:
             manager = self.memory.u32(self.lawn_app + LAWN_APP_WIDGET_MANAGER)
             if not self._reasonable_pointer(manager):
-                return 0
+                return 0, 0
             dialog = self.memory.u32(manager + WIDGET_MANAGER_TOP_MODAL)
             if not self._reasonable_pointer(dialog):
-                return 0
-            return self.memory.u32(dialog + DIALOG_ID)
+                return 0, 0
+            raw_id = self.memory.u32(dialog + DIALOG_ID)
+            top = self.memory.u32(manager + WIDGET_MANAGER_TOP_WIDGET)
+            # 返回选关后 top_modal 可能残留，但 top_widget 已经不是它。
+            if dialog != top:
+                return raw_id, 0
+            visible = self.memory.u32(dialog + WIDGET_VISIBLE) & 0xFF
+            return raw_id, visible
         except OSError:
-            return 0
+            return 0, 0
 
     def chooser_ready(self) -> bool:
         try:
@@ -1044,11 +1072,13 @@ class GameSession:
             x = self._signed_u32(self.memory.u32(button + WIDGET_X))
             y = self._signed_u32(self.memory.u32(button + WIDGET_Y))
             geometry_ok = self._chooser_geometry_ok(chooser)
+            raw_id, visible = self._top_modal_raw()
+            hide_id = self.covering_dialog_id()
             return (
                 f"{'ready' if geometry_ok else 'geom'} "
                 f"w={width} h={height} x={x} y={y} "
                 f"modal={self.modal_layers()} "
-                f"cover={self.covering_dialog_id()}"
+                f"cover={raw_id} vis={visible} hide={hide_id}"
             )
         except Exception as exc:
             return f"error:{exc}"
@@ -2095,6 +2125,7 @@ class IntegratedDeckOverlay:
         self._overlay_visible = False
         self._hide_misses = 0
         self._last_tick_reason = ""
+        self._last_heartbeat = time.monotonic()
         self._tk_mapped = False
         self._prefs_ready = False
         self._build()
@@ -2105,7 +2136,8 @@ class IntegratedDeckOverlay:
         self.root.withdraw()
         overlay_log(
             f"assistant start v{ASSISTANT_VERSION} "
-            f"frozen={bool(getattr(sys, 'frozen', False))}"
+            f"frozen={bool(getattr(sys, 'frozen', False))} "
+            f"pid={os.getpid()}"
         )
         self._tick()
 
@@ -2163,11 +2195,23 @@ class IntegratedDeckOverlay:
             width=14,
         )
         name_entry.grid(
-            row=0, column=1, columnspan=3, sticky="ew", padx=1, pady=(0, 2)
+            row=0, column=1, columnspan=2, sticky="ew", padx=1, pady=(0, 2)
         )
         name_entry.bind("<Return>", self._commit_name)
         name_entry.bind("<FocusOut>", self._commit_name)
         self.name_entry = name_entry
+
+        tk.Button(
+            bar,
+            text="日志",
+            width=4,
+            bg="#5a3a22",
+            fg="#f6d89b",
+            activebackground="#6d4a2e",
+            pady=0,
+            font=("Microsoft YaHei UI", 8),
+            command=self.open_log_folder,
+        ).grid(row=0, column=3, padx=(1, 0), sticky="ew")
 
         tk.Button(
             bar,
@@ -2534,7 +2578,26 @@ class IntegratedDeckOverlay:
             self._refresh_slot_buttons,
         )
 
+    def _heal_stuck_drag(self) -> None:
+        """拖拽中若左键已物理松开（ButtonRelease 事件被吞），强制结束拖拽。
+
+        否则 _dragging 永远为 True，_attach_to_game 直接 return，
+        悬浮条从此不再显示，而进程仍在运行（心跳 flag=False reason=show）。
+        """
+        if not self._dragging:
+            return
+        try:
+            button_down = bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+        except Exception:
+            return
+        if not button_down:
+            self._dragging = False
+            self._last_place = None
+            overlay_log("drag-healed: lost ButtonRelease")
+
     def _tick(self) -> None:
+        self._heal_stuck_drag()
+        session: GameSession | None = None
         try:
             session = self.connector.ensure_session()
             if not session:
@@ -2578,10 +2641,44 @@ class IntegratedDeckOverlay:
                 self._schedule_hide()
             except Exception:
                 pass
+        finally:
+            # 心跳与下一次 tick 的重排必须无条件执行，否则一次未捕获异常
+            # 就会让悬浮条永久停在当前状态（进程还活着）。
+            try:
+                self._heartbeat(session)
+            except Exception as exc:
+                overlay_log(f"heartbeat-error {exc!r}")
+            try:
+                self.root.after(250, self._tick)
+            except Exception as exc:
+                overlay_log(f"after-failed {exc!r}")
+
+    def _heartbeat(self, session: GameSession | None) -> None:
+        now = time.monotonic()
+        if now - self._last_heartbeat < HEARTBEAT_SECONDS:
+            return
+        self._last_heartbeat = now
+        win_vis = False
         try:
-            self.root.after(250, self._tick)
-        except Exception as exc:
-            overlay_log(f"after-failed {exc!r}")
+            win_vis = bool(user32.IsWindowVisible(self._overlay_hwnd()))
+        except Exception:
+            pass
+        extra = session.chooser_status() if session else "no-session"
+        overlay_log(
+            f"heartbeat reason={self._last_tick_reason} "
+            f"flag={self._overlay_visible} win32={win_vis} {extra}"
+        )
+
+    def open_log_folder(self) -> None:
+        path = _app_data_dir() / "overlay.log"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.is_file():
+                path.write_text("", encoding="utf-8")
+            overlay_log("open-log-folder")
+            os.startfile(path.parent)
+        except OSError as exc:
+            self.status.set(f"无法打开日志：{exc}")
 
     def _note_hide(self, reason: str) -> None:
         if reason != self._last_tick_reason:

@@ -28,11 +28,13 @@
 | 清空 | 移走已选卡片；默认保留戴夫/关卡锁定卡 |
 | 覆盖锁定卡 | 勾选并确认后，应用/清空才会动锁定卡 |
 | 排序 | 打开名称条，拖动调整未锁定卡片的顺序 |
+| 日志 | 打开本机日志目录，便于排错 |
 
-卡组保存在当前 Windows 用户目录：
+卡组和运行日志保存在当前 Windows 用户目录：
 
 ```text
 %APPDATA%\PvZHybridDeckAssistant\decks.json
+%APPDATA%\PvZHybridDeckAssistant\overlay.log
 ```
 
 ## 限制
