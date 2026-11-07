@@ -22,7 +22,7 @@ from typing import Iterable
 
 
 PROCESS_NAME = "PlantsVsZombies.exe"
-ASSISTANT_VERSION = "2.5.7"
+ASSISTANT_VERSION = "2.5.8"
 PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_VM_OPERATION = 0x0008
 PROCESS_VM_READ = 0x0010
@@ -94,7 +94,7 @@ MAX_PRESET_CARDS = 32
 MAX_MEMORY_READ = 65536
 # 选中卡槽在窗口顶部，覆盖层默认放在此高度之下，避免挡住卡槽。
 SEED_BANK_ROW_HEIGHT = 88
-PRESET_SLOT_COUNT = 8
+PRESET_SLOT_COUNT = 16
 MAX_PRESET_NAME_LEN = 12
 SLOT_BUTTON_LABEL_LEN = 5
 WIDGET_X = 0x08
@@ -2091,7 +2091,7 @@ class DeckOrderStrip:
 
 
 class IntegratedDeckOverlay:
-    PANEL_HEIGHT = 220
+    PANEL_HEIGHT = 264
     SLOT_COLUMNS = 4
 
     def __init__(self) -> None:
@@ -2225,6 +2225,8 @@ class IntegratedDeckOverlay:
             command=self.close,
         ).grid(row=0, column=4, padx=(3, 0), sticky="ew")
 
+        slot_rows = (PRESET_SLOT_COUNT + self.SLOT_COLUMNS - 1) // self.SLOT_COLUMNS
+        action_row = 1 + slot_rows
         for index in range(PRESET_SLOT_COUNT):
             row, column = divmod(index, self.SLOT_COLUMNS)
             button = tk.Button(
@@ -2257,7 +2259,7 @@ class IntegratedDeckOverlay:
             pady=0,
             font=("Microsoft YaHei UI", 8),
             command=self.save_current,
-        ).grid(row=3, column=0, padx=1, pady=(4, 0), sticky="ew")
+        ).grid(row=action_row, column=0, padx=1, pady=(4, 0), sticky="ew")
         tk.Button(
             bar,
             text="应用",
@@ -2266,7 +2268,7 @@ class IntegratedDeckOverlay:
             pady=0,
             font=("Microsoft YaHei UI", 8),
             command=self.apply_current,
-        ).grid(row=3, column=1, padx=1, pady=(4, 0), sticky="ew")
+        ).grid(row=action_row, column=1, padx=1, pady=(4, 0), sticky="ew")
         tk.Button(
             bar,
             text="排序",
@@ -2275,7 +2277,7 @@ class IntegratedDeckOverlay:
             pady=0,
             font=("Microsoft YaHei UI", 8),
             command=self.open_sorter,
-        ).grid(row=3, column=2, padx=1, pady=(4, 0), sticky="ew")
+        ).grid(row=action_row, column=2, padx=1, pady=(4, 0), sticky="ew")
         tk.Button(
             bar,
             text="清空",
@@ -2284,7 +2286,7 @@ class IntegratedDeckOverlay:
             pady=0,
             font=("Microsoft YaHei UI", 8),
             command=self.clear_current,
-        ).grid(row=3, column=3, padx=1, pady=(4, 0), sticky="ew")
+        ).grid(row=action_row, column=3, padx=1, pady=(4, 0), sticky="ew")
 
         self.status_label = tk.Label(
             bar,
@@ -2298,7 +2300,7 @@ class IntegratedDeckOverlay:
             font=("Microsoft YaHei UI", 8),
         )
         self.status_label.grid(
-            row=4, column=0, columnspan=5, sticky="nsew", pady=(3, 0)
+            row=action_row + 1, column=0, columnspan=5, sticky="nsew", pady=(3, 0)
         )
         self.status_label.bind("<ButtonPress-1>", self._drag_start)
         self.status_label.bind("<B1-Motion>", self._drag_move)
@@ -2316,10 +2318,12 @@ class IntegratedDeckOverlay:
             font=("Microsoft YaHei UI", 8),
             anchor="w",
         )
-        overwrite.grid(row=5, column=0, columnspan=5, sticky="w", pady=(1, 0))
+        overwrite.grid(
+            row=action_row + 2, column=0, columnspan=5, sticky="w", pady=(1, 0)
+        )
         for column in range(5):
             bar.columnconfigure(column, weight=1)
-        bar.rowconfigure(4, weight=1)
+        bar.rowconfigure(action_row + 1, weight=1)
 
     def _select_slot(self, index: int) -> None:
         self._commit_name()
@@ -2829,7 +2833,7 @@ class DeckAssistantWindow:
         self.store = PresetStore()
         self.root = tk.Tk()
         self.root.title(f"杂交版 v3.12 卡组助手 · {ASSISTANT_VERSION}")
-        self.root.geometry("720x820")
+        self.root.geometry("720x1080")
         self.root.minsize(650, 640)
 
         self.selected_slot = tk.IntVar(value=0)
